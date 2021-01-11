@@ -1,0 +1,315 @@
+---
+title: "R Notebook"
+output:
+  html_document:Final_code
+    df_print: paged
+---
+
+
+# Load Data
+```{r warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE)
+library(tidyverse)
+library(plotly)
+library(rgdal)
+library(broom)
+library(crosstalk)
+library(sf)
+library(sp)
+library(spdep)
+library(car)
+library(fs)
+library(janitor)
+
+
+
+rawdata <- read_csv("London data/phe_cases_london_boroughs.csv") %>% 
+  filter(date == "2020/12/2")
+
+mapdata <- read_sf("London data/statistical-gis-boundaries-london/ESRI/London_Borough_Excluding_MHW.shp") %>% 
+  st_transform(("+init=epsg:4326"))
+
+
+
+traffic_flow_borough <- readxl::read_xls("London data/traffic-flow-borough-.xls", sheet = "Traffic Flows - All vehicles") %>% 
+  select("LA Code", "2020estimate") %>% 
+  drop_na() 
+
+finadata <- mapdata %>% 
+  select(NAME, GSS_CODE, geometry) %>% 
+  left_join(rawdata %>% 
+              select(new_cases, area_code), by = c("GSS_CODE" = "area_code")) %>% 
+  left_join(traffic_flow_borough, by = c("GSS_CODE" = "LA Code")) 
+
+```
+# Additional Data -------------------------------------------------
+```{r}
+
+lon <- lapply(finadata$geometry, FUN = function(x){st_centroid(x)[1]}) %>% 
+  unlist()
+lat <- lapply(finadata$geometry, FUN = function(x){st_centroid(x)[2]}) %>% 
+  unlist()
+
+finadata2 <- finadata %>% 
+  mutate(lon = lon) %>% 
+  mutate(lat = lat) %>% 
+  rename(estimate2020 = `2020estimate`)
+
+ggplot() + 
+  geom_sf(data = mapdata, aes(geometry = geometry, fill = NAME), show.legend = FALSE) + 
+  geom_point(data = finadata2, aes(x = lon, y = lat)) + 
+  theme_bw() + 
+  labs(title = "the centroids of all Wards in London") + 
+  theme(panel.border = element_blank())
+```
+```{r}
+five_data <- readxl::read_excel("newdata.xlsx")
+
+finadata3 <- finadata2 %>% select(NAME, GSS_CODE, lon, lat) %>% left_join(five_data, by = c("NAME" = "...1"))
+
+# scatter plot
+```{r}
+ggplot(data = finadata3, aes(x = traffic_flow, y = Covid_cases))  +
+  geom_point() + geom_smooth()
+
+```
+
+# Linear Regression Model
+```{r}
+model1 <- lm(Covid_cases~traffic_flow, data = finadata3)
+summary(model1)
+```
+# Bootstrap resampling
+```{r}
+booostdata <- finadata3 %>% 
+  select(Covid_cases, 
+         traffic_flow)
+```
+# To provide the results changing
+```{r}
+library(rsample)
+set.seed(2020)
+
+data_boot <-st_drop_geometry(booostdata) %>%
+  bootstraps(times = 1000, apparent = TRUE)
+
+
+slice_tail(data_boot, n=5)
+```
+# To run the linear regression model for each of our bootstrap resampled instances.
+```{r}
+data_models <- data_boot %>% 
+  mutate(model = map(splits, ~ lm(Covid_cases~traffic_flow, data = .)))
+data_models$model[[1]]
+```
+# Tidy up models results
+```{r}
+data_models_tidy <- data_models %>% 
+  mutate(coef_info = map(model, tidy))
+data_coef <- data_models_tidy %>% 
+  unnest(coef_info)
+data_coef
+```
+```{r}
+coef <- data_coef %>% 
+  filter(term == "Covid_cases")
+coef
+
+```{r}
+# histogram of coefficients
+coef %>%
+  ggplot(aes(x=estimate)) +
+  geom_histogram(position="identity", 
+                 alpha=0.5, 
+                 bins=15, 
+                 fill="lightblue2", col="lightblue3")+
+  geom_vline(aes(xintercept=mean(estimate)),
+                 color="blue",
+             linetype="dashed")+
+  labs(title="Bootstrap resample estimates",
+       x="Coefficient estimates",
+       y="Frequency")+
+  theme_classic()+
+  theme(plot.title = element_text(hjust = 0.5))
+```
+```{r}
+# Do hypothesis test at 95% confidence level
+library(rsample)
+int_pctl(data_models_tidy, coef_info, alpha = 0.05)
+```
+
+```{r}
+data_aug <- data_models_tidy %>%
+  #sample_n(5) %>%
+  mutate(augmented = map(model, augment))%>%
+  unnest(augmented)
+```
+Now, let’s have a look at our first bootstrap…
+```{r}
+firstboot<-filter(data_aug,id=="Bootstrap0001")
+
+firstbootlength <- firstboot %>%
+  dplyr::select(Covid_cases)%>%
+  pull()%>%
+  length()
+```
+# use all the lines from the bootstrap resamples to show the possible variance.
+```{r}
+ggplot(data_aug, aes(traffic_flow,
+                  Covid_cases))+
+  geom_line(aes(y = .fitted, group = id), alpha = .2, col = "cyan3") +  
+  geom_point(data=filter(data_aug,id=="Apparent"))+
+  labs(x="traffic_flow",
+       y="Covid_cases")
+```
+
+```{r}
+
+
+#let's check the distribution of these variables first
+
+ggplot(finadata3, aes(x=Covid_cases)) + 
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 400) + 
+  geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+```
+```{r}
+ggplot(finadata3, aes(x=traffic_flow)) + 
+  geom_histogram(aes(y = ..density..),
+                 binwidth = 600) + 
+  geom_density(colour="red", 
+               size=1, 
+               adjust=1)
+```
+# traffic flow data seems that a little bit skewed
+
+```{r}
+ggplot(finadata3, aes(x=log(traffic_flow))) + 
+  geom_histogram()
+```
+
+# it seems that the data of log(Covid_cases) is more normal. However, it is not worth changing the model.
+```{r}
+symbox(~Covid_cases, finadata3, na.rm=TRUE, powers=seq(-3, 3, by = 0.5))
+```
+symbox(~Covid_cases, finadata3, na.rm=TRUE, powers=seq(-3, 3, by = 0.5))
+```{r}
+model2 <- lm(Covid_cases ~log(traffic_flow), data = finadata3)
+summary(model2)
+```
+```{r}
+glance(model2)
+```
+```{r}
+
+cleandata3 <- finadata3 %>% 
+  slice(-c(model2[["na.action"]] %>% 
+             unname() %>% 
+             magrittr::extract(c(1, 2)))) %>% 
+  mutate(model1resids = residuals(model1))
+
+```
+# Homoscedasticity
+```{r}
+par(mfrow = c(2, 2))
+plot(model1)
+```
+# "Residual vs Fitted" plot shows that residual points are random and the red line is basically straight. In addition, residual points are also roughly matching the normal distribution line. Therefore, residual analysis shows that it is reasonable to use linear regression model.
+
+#  Standard Autocorrelation
+```{r}
+#run durbin-watson test
+DW <- durbinWatsonTest(model1)
+tidy(DW)
+```
+# DW statistic for the model1 is 1.798421. Although it exsits autocorrelation, the statistic is not larger than 2. 
+
+```{r}
+llondon_nb <- cleandata3 %>% 
+  select(-c(lon, lat)) %>% 
+  poly2nb(., queen = TRUE)
+
+coordsw <- cleandata3 %>% 
+  st_centroid() %>% 
+  st_geometry()
+knn_london <- coordsw %>% 
+  knearneigh(., k=4)
+
+london_knn<- knn_london %>% 
+  knn2nb()
+plot(coordsw)
+```
+```{r}
+plot(llondon_nb, st_geometry(coordsw), col='red')
+```
+```{r}
+plot(london_knn, st_geometry(coordsw), col="blue")
+```
+
+```{r}
+#create a spatial weights matrix object from these weights
+
+Llondon.queens_weight <- llondon_nb %>%
+  nb2listw(., style="C")
+
+Llondon.knn_4_weight <- london_knn %>%
+  nb2listw(., style="C")
+```
+
+# Now run a moran’s I test on the residuals, first using queens neighbours
+
+```{r}
+Queen <- cleandata3 %>%
+  st_drop_geometry()%>%
+  dplyr::select(model1resids)%>%
+  pull()%>%
+  moran.test(., Llondon.queens_weight)%>%
+  tidy()
+
+Queen
+```
+
+
+# Then nearest k-nearest neighbours
+```{r}
+nearest_neighbour <- cleandata3 %>%
+  st_drop_geometry()%>%
+  dplyr::select(model1resids)%>%
+  pull()%>%
+  moran.test(., Llondon.knn_4_weight)%>%
+  tidy()
+
+nearest_neighbour
+```
+# Spatial Lag model
+```{r}
+slag_dv_model1_queen <- lagsarlm((Covid_cases) ~traffic_flow, data = cleandata3,
+                                 nb2listw(llondon_nb, style = "C"),
+                                 method = "eigen")
+tidy(slag_dv_model1_queen)
+```
+
+```{r}
+glance(slag_dv_model1_queen)
+```
+
+```{r}
+t <- summary(slag_dv_model1_queen)
+```
+
+```{r}
+slag_dv_model2_knn4 <- lagsarlm(Covid_cases ~log(traffic_flow), data = cleandata3,
+                                 nb2listw(london_knn, style = "C"),
+                                 method = "eigen")
+tidy(slag_dv_model2_knn4)
+```
+```{r}
+cleandata3 <- cleandata3 %>% mutate(slag_dv_model2_knn_resides = residuals(slag_dv_model2_knn4))
+knn4moran <- cleandata3 %>% 
+  st_drop_geometry() %>% 
+  select(slag_dv_model2_knn_resides) %>% 
+  pull() %>% moran.test(., Llondon.knn_4_weight) %>% tidy()
+knn4moran
+```
